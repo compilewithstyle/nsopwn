@@ -5,8 +5,8 @@
 #  	Written by Nicholas Siow | n.siow@wustl.edu
 #  
 #  [Description]:
-#  	Parses fastnmap output and builds an easily-searchable
-#  	database using that information
+#  	Parses fastnmap output and builds a CSV file for excel from
+#	that information
 #  
 #  [Revision History]:
 #  	2014-12-11	broke script into subroutines, added &device_type_try
@@ -53,19 +53,17 @@ Options:
 		[NOT YET IMPLEMENTED]
 	-d
 		turn on program debugging
-	-t [SEARCH]
-		try only a specific NMAP entry,
-		will find the first result with
-		SEARCH and show only the processing
-		for that entry (for development)
+	-t
+		testing mode, only runs on a subset
+		of the samples
 HELP
 
 # check if the user is asking for help
 print $HELP and exit if grep /-h|--help/, @ARGV;
 	
 # parse command line arguments
-my ($opt_s, $opt_q, $opt_d, $opt_t);
-getopts('s:qdt:');
+our ($opt_s, $opt_q, $opt_d, $opt_t);
+getopts('s:qdt');
 
 # make sure they specified a fastnmap results directory
 if( scalar @ARGV == 0 ) {
@@ -118,51 +116,90 @@ sub progress_set_stage( $ ) {
 #	functions to help searching for known terms within a fastnmap result
 #--------------------------------------------------------------------------------
 
-my %known_products = (
-	windows   => 'windows',
-	microsoft => 'windows',
-	linux     => 'linux',
-	ubuntu    => 'linux',
-	fedora    => 'linux',
-	centos    => 'linux',
-	unix      => 'linux',
-	'red hat' => 'linux',
-	apple	  => 'apple',
-	solaris   => 'solaris',
-	printer   => 'printer',
-	laserjet  => 'printer',
-	switch    => 'switch',
-	camera    => 'camera',
-	vxworks   => 'vxworks',
-	firewall  => 'firewall',
-);
+my $known_products = <<'END';
+
+	windows    =  windows
+	microsoft  =  windows
+	linux      =  linux
+	ubuntu     =  linux
+	fedora     =  linux
+	centos     =  linux
+	unix       =  linux
+	red hat    =  linux
+	apple	   =  apple
+	solaris    =  solaris
+	printer    =  printer
+	laserjet   =  printer
+	switch     =  switch
+	camera     =  camera
+	vxworks    =  vxworks
+	firewall   =  firewall
+
+END
+
+# process known product
+my @product_keys;
+my @product_values;
+foreach( split("\n", $known_products) ) {
+        next unless $_;
+        s/^\s+//;
+
+        my @values = split(/\s+=\s+/, $_);
+        push @product_keys, @values[0];
+        push @product_values, @values[1];
+}
+
+# helper function to offer a hash-like interface to the
+# known_products info
+sub product_helper( $ ) {
+	my $text = shift;
+
+	return "" unless defined $text;
+
+	foreach my $i (0..$#product_keys) {
+		my $search = $product_keys[$i];
+		return $product_values[$i]
+			if $text =~ /$search/i;
+	}
+
+	return "";
+}
 
 # takes an Operating Systems string and attempts to standardize it
 # by looking at the list of known products. for example, if the
 # operating system contains the string 'laserjet' it will be 
 # marked as a printer
-sub os_info_search( $ )
+sub product_search( $ )
 {
-	my $os_string = shift;
+	my $text = shift;
+	return product_helper($text);
+}
 
-	foreach( keys %known_products )
-	{
-		return $known_products{$_} if $os_string =~ /$_/i;
-	}
-
-	return '';
+# converts the given hash object into a string and performs
+# a fulltext search using the keys of the known_products array
+sub fulltext_product_search( $ ) {
+	my $obj = shift;
+	return product_helper(Dumper($obj));
 }
 
 # takes a hash reference for a host or sub-field of the host and
 # performs a full-text search across all fields of the hash looking
 # for the given string
-sub fulltext_search( $$ )
+sub fulltext_term_search( $$ )
 {
 	my $hashobject = shift;
 	my $searchterm = shift;
 
 	my $s = index Dumper($hashobject), $searchterm;
 	return $s == -1 ? 0 : 1;
+}
+
+sub extract_service( $$ ) {
+	my $host = shift;
+	my $port = shift;
+
+	my ($service) = grep { $_->{port} eq $port } @{$host->{services}};
+	return $service;
 }
 
 #--------------------------------------------------------------------------------
@@ -179,12 +216,17 @@ sub device_type_try( $ )
 	#	Attempt #1 -- use 100% confidence OS data if it exists
 	#------------------------------------------------------------------------
 
-	if( defined $host->{os_guess} && ($host->{os_guess} =~ /apple/i || $host->{os_guess} !~ / or /i) )
+	if( $host->{os_guess} )
 	{
-		$host->{device_type} = os_info_search( $host->{os_guess} );
-		$host->{os_flavor} = lc $host->{os_guess};
-		$host->{method} = 1;
-		return if $host->{device_type} ne '';
+		# only do this for os_guesses that don't have the word " or " in
+		# them, or for apple products where the " or " tends to
+		# still be a high-fidelity guess
+		if($host->{os_guess} =~ /apple/i || $host->{os_guess} !~ / or /i) {
+			$host->{device_type} = product_search( $host->{os_guess} );
+			$host->{os_flavor} = lc $host->{os_guess};
+			$host->{method} = 1;
+			return if $host->{device_type} ne '';
+		}
 	}
 
 	#------------------------------------------------------------------------
@@ -193,7 +235,7 @@ sub device_type_try( $ )
 
 	if( defined $host->{smb}->{os} )
 	{
-		$host->{device_type} = os_info_search( $host->{smb}->{os} );
+		$host->{device_type} = product_search( $host->{smb}->{os} );
 		$host->{os_flavor}   = lc $host->{smb}->{os};
 		$host->{method} = 2;
 		return if $host->{device_type} ne '';
@@ -203,23 +245,10 @@ sub device_type_try( $ )
 	#	Attempt #3 -- use port 80/443 webserver identification
 	#------------------------------------------------------------------------
 
-	if( grep { $_->{port} eq 80 } @{$host->{services}} )
+	my $service;
+	if( ($service = extract_service($host, 80)) || ($service = extract_service($host, 443)) )
 	{
-		my ($service) = grep { $_->{port} eq '80' } @{$host->{services}};
-		$host->{device_type} = os_info_search( Dumper($service) );
-		if( $service->{extrainfo} ne '' ) {
-			$host->{os_flavor} = $service->{extrainfo};
-		}
-		elsif( $service->{product} ne '' ) {
-			$host->{os_flavor} = $service->{product};
-		}
-		$host->{method} = 3;
-		return if $host->{device_type} ne '';
-	}
-	if( grep { $_->{port} eq 443 } @{$host->{services}} )
-	{
-		my ($service) = grep { $_->{port} eq '443' } @{$host->{services}};
-		$host->{device_type} = os_info_search( Dumper($service) );
+		$host->{device_type} = fulltext_product_search( $service );
 		if( $service->{extrainfo} ne '' ) {
 			$host->{os_flavor} = $service->{extrainfo};
 		}
@@ -234,11 +263,15 @@ sub device_type_try( $ )
 	#	Attempt #4 -- use port 22 ssh identification
 	#------------------------------------------------------------------------
 
-	if( grep { $_->{port} eq 22 } @{$host->{services}} )
+	if( $service = extract_service($host, 22) )
 	{
-		my ($service) = grep { $_->{port} eq '22' } @{$host->{services}};
-		$host->{os_flavor} = os_info_search( $service->{extrainfo} );
-		$host->{device_type} = $host->{os_flavor} // undef;
+		$host->{device_type} = fulltext_product_search( $service );
+		if( $service->{extrainfo} ne '' ) {
+			$host->{os_flavor} = $service->{extrainfo};
+		}
+		elsif( $service->{product} ne '' ) {
+			$host->{os_flavor} = $service->{product};
+		}
 		$host->{method} = 4;
 		return if $host->{device_type} ne '';
 	}
@@ -249,7 +282,7 @@ sub device_type_try( $ )
 
 	foreach my $service ( @{$host->{services}} )
 	{
-		if( exists $service->{product} && os_info_search($service->{product}) eq 'windows' )
+		if( exists $service->{product} && product_search($service->{product}) eq 'windows' )
 		{
 			$host->{device_type} = 'windows';
 			$host->{os_flavor}   = 'windows';
@@ -406,6 +439,7 @@ sub read_xml_files( $ )
 		my @lines = read_file($_);
 		push @finished_scans, $_ if grep /\/nmaprun/, @lines;
 		progress( scalar @finished_scans, scalar @files );
+		last if $opt_t && scalar(@finished_scans) >= 100;
 	}
 
 	progress_done(sprintf("Found %d completed scans", scalar @finished_scans));
@@ -438,6 +472,7 @@ sub find_hosts( $ )
 		# only pull in hosts that were up
 		push @hosts, $_ foreach ($np->all_hosts('up'));
 		progress( scalar @hosts, scalar @finished_scans );
+		last if $opt_t && scalar(@hosts) >= 100;
 	}
 
 	progress_done(sprintf("Found %d hosts", scalar @hosts));
