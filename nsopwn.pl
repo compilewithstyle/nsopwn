@@ -82,25 +82,36 @@ unless( -e $results_dir ) {
 #	helper function to print progress text
 #--------------------------------------------------------------------------------
 
+my $lastblocks = 0;
+
 my %progress_hash;
 sub progress( $$ )
 {
-	my $progress_string = shift;
-	my $total_todo      = shift;
+	my $done  = shift;
+	my $total = shift;
+	my $percentage = $done / $total;
+	my $blocks = int( 50 * $percentage );
 
-	my $done = $progress_hash{$progress_string} // 0;
+	if($blocks != $lastblocks && $blocks > 0) {
+		$lastblocks = $blocks;
+		printf "\r\t%s%-62s%s", colored(["white on_white"], " "),
+			colored(["red on_red"], "#"x$blocks), colored(["white on_white"], " ");
+	}
+}
 
-	my $am_finished = $total_todo - $done == 1 ? 1 : 0;
+# helper function to make sure the current line is cleaned up
+# before going on to the next progress text
+sub progress_done( $ ) {
+	my $message = shift;
+	my $lastblocks = 0;
+	printf "\r\t%s%-62s%s\n\t%s\n\n", colored(["white on_white"], " "),
+ 		colored(["green on_green"], "#"x50),
+		colored(["white on_white"], " "), $message;
+}
 
-	$am_finished ? print color 'green' : print color 'red';
-
-	printf "\r" . $progress_string, $done+1, $total_todo;
-
-	print color 'reset';
-
-	++$progress_hash{$progress_string};
-
-	print "\n" if $am_finished;
+# set the current stage of the script
+sub progress_set_stage( $ ) {
+	say $_[0] . "...";
 }
 
 #--------------------------------------------------------------------------------
@@ -363,17 +374,15 @@ sub device_type_try( $ )
 
 sub find_xml_files()
 {
+	progress_set_stage("Looking for XML files");
 	my @xml_files;
-	foreach my $topdir ( @ARGV )
-	{
-		chomp ( my @files = `find $topdir -name *xml` );
-		print color 'red';
-		print "Looking for XML files...\n";
-		print color 'green';
-		printf "\tfound %d files in directory %s\n", scalar @files, $topdir;
-		print color 'reset';
-		push @xml_files, $_ foreach @files;
+
+	chomp ( my @files = `find $results_dir -name *xml` );
+	foreach( @files ) {
+		push @xml_files, $_;
+		progress(scalar @xml_files, scalar @files);
 	}
+	progress_done(sprintf("Found %d files in directory %s", scalar @files, $results_dir));
 
 	return \@xml_files;
 }
@@ -390,16 +399,18 @@ sub read_xml_files( $ )
 
 	# iterate through files, reading in each one and adding it to
 	# the list of finished scans if the completion string is found
+	progress_set_stage("Reading in XML files");
 	my @finished_scans;
 	foreach( @files )
 	{
 		my @lines = read_file($_);
-		push @finished_scans, $_ if grep { /\/nmaprun/ } @lines;
-	
-		progress( "Reading in XML files: [%5d / %5d]", scalar @files );
+		push @finished_scans, $_ if grep /\/nmaprun/, @lines;
+		progress( scalar @finished_scans, scalar @files );
 	}
+
+	progress_done(sprintf("Found %d completed scans", scalar @finished_scans));
 	
-	die "Found no finished nmap scans in dir: $ARGV[0]" if scalar @finished_scans == 0;
+	die "Found no finished nmap scans in dir: $results_dir" if scalar @finished_scans == 0;
 
 	return \@finished_scans;
 }
@@ -418,6 +429,7 @@ sub find_hosts( $ )
 
 	# iterate through the file texts and use the Nmap::Parser
 	# module to parse the data
+	progress_set_stage("Parsing NMAP results");
 	my @hosts;
 	foreach my $file ( @finished_scans )
 	{
@@ -425,9 +437,10 @@ sub find_hosts( $ )
 	
 		# only pull in hosts that were up
 		push @hosts, $_ foreach ($np->all_hosts('up'));
-	
-		progress( "Parsing nmap results: [%5d / %5d]", scalar @finished_scans );
+		progress( scalar @hosts, scalar @finished_scans );
 	}
+
+	progress_done(sprintf("Found %d hosts", scalar @hosts));
 	
 	die "Nmap::Parser returned 0 hosts." if scalar @hosts == 0;
 
@@ -444,6 +457,7 @@ sub parse_hosts( $ )
 	my @hosts = @{ $_[0] };
 
 	my @host_info;
+	progress_set_stage("Attempting to determine device type / os flavor");
 	foreach my $host ( @hosts )
 	{
 		# sql-entry hash
@@ -528,8 +542,9 @@ sub parse_hosts( $ )
 	
 		push @host_info, \%h;
 
-		progress( "Parsing nmap host data: [%5d / %5d]", scalar @hosts );
+		progress( scalar @host_info, scalar @hosts );
 	}
+	progress_done(sprintf("Completed info for %d hosts", scalar @host_info));
 
 	# remove large variables from memory
 	return \@host_info;
@@ -548,6 +563,8 @@ sub separate_services( $ )
 	# pull out the list of host info
 	my @host_info = @{ $_[0] };
 
+	my $done = 0;
+	progress_set_stage("Separating unique services");
 	foreach my $host ( @host_info )
 	{
 		# pull out information common to all services on this host
@@ -583,9 +600,10 @@ sub separate_services( $ )
 		}
 
 		# try to standardize the values for each of these
-
-		progress( "Separating services: [%5d / %5d]", scalar @host_info );
+		progress( $done, scalar @host_info );
+		++$done;
 	}
+	progress_done(sprintf("Processed %d services", scalar @service_list));
 
 	return \@service_list;
 }
@@ -605,9 +623,9 @@ sub check_guesses( $$ )
 	}
 
 	#print color 'orange';
-        print color 'red';
-	printf "Completed guesses for %5d / %5d hosts\n", $completed_guesses, scalar @hosts;
-	print color 'reset';
+	my $percentage = int($completed_guesses / scalar(@hosts) * 100);
+	printf "Completed guesses for %d / %d hosts (%d%%)\n", $completed_guesses,
+		scalar @hosts, $percentage;
 }
 
 # write to CSV with 1 host per line, each host service on the same line
@@ -725,6 +743,7 @@ unless( caller )
 	csv_write_2( $service_list );
 
 	# determine how well the os-guess logic worked
+	print "Script complete! Check your results in 'nmap_results.csv'\n";
 	check_guesses( $host_info, $hosts );
 }
 
