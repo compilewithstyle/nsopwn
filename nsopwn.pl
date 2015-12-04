@@ -14,10 +14,10 @@
 #  			OS info / identity of the device
 #  	2014-06-30	finished script, tested and seems to be working.
 #  	2014-06-27	switched to perl from python, better nmap-parsing lib
+#	2015-12-04	overhaul of new rules from Brian's manual work
 #  
 #  [Todo]:
-#	+ check the validity of the OS guesses
-#  	[done] look for additional ways to determine the device info
+#	+ add import for subnet data
 #--------------------------------------------------------------------------------
 
 use strict;
@@ -29,6 +29,7 @@ use File::Slurp;
 use Tie::IxHash;
 use Data::Dumper;
 use Nmap::Parser;
+use Getopt::Std;
 use Term::ANSIColor;
 use Hash::Flatten qw| flatten |;
 use feature 'say';
@@ -36,25 +37,45 @@ use feature 'say';
 # turn on STDOUT autoflush
 $| = 1;
 
-my $TEST = grep { $_ eq '--test' } @ARGV;
-my $TESTAMOUNT = 500;
-my $TABLENAME = 'nmap';
+# define help string
+my $HELP = <<'HELP';
+nsopwn.pl: Smart fastnmap parsing for the WUSTL NSO
 
-# check the supplied arguments and read in the nmap results
-if( scalar @ARGV == 0 )
-{
-	print "Please enter a valid log directory.\n";
-	print "Usage: ./nsopwn [LOGDIRS...]\n";
-	exit(1);
+Usage: nsopwn.pl [OPTIONS] NMAP_RESULTS_DIR
+
+Options:
+	-s [SUBNET_FILE]
+		read from the given subnet
+		file to enrich the results with subnet
+		info - see README for formatting details
+	-q
+		write to sqlite database instead of CSV
+		[NOT YET IMPLEMENTED]
+	-d
+		turn on program debugging
+	-t [SEARCH]
+		try only a specific NMAP entry,
+		will find the first result with
+		SEARCH and show only the processing
+		for that entry (for development)
+HELP
+
+# check if the user is asking for help
+print $HELP and exit if grep /-h|--help/, @ARGV;
+	
+# parse command line arguments
+my ($opt_s, $opt_q, $opt_d, $opt_t);
+getopts('s:qdt:');
+
+# make sure they specified a fastnmap results directory
+if( scalar @ARGV == 0 ) {
+	print $HELP and exit;
 }
 
-foreach( @ARGV )
-{
-	unless( defined $_ && -e $_ )
-	{
-		printf "Invalid log directory: %s\n", $_;
-		exit(1);
-	}
+# get the directory for fastnmap results
+my $results_dir = shift @ARGV;
+unless( -e $results_dir ) {
+	say "[ERROR] Invalid results directory: " . $results_dir;
 }
 
 #--------------------------------------------------------------------------------
@@ -83,8 +104,7 @@ sub progress( $$ )
 }
 
 #--------------------------------------------------------------------------------
-#	function to compare an OS / device string against a list of known
-#	products to try to add a standardized tag
+#	functions to help searching for known terms within a fastnmap result
 #--------------------------------------------------------------------------------
 
 my %known_products = (
@@ -104,10 +124,12 @@ my %known_products = (
 	camera    => 'camera',
 	vxworks   => 'vxworks',
 	firewall  => 'firewall',
-#	osx       => 'mac osx',
-#	cisco     => 'cisco',
 );
 
+# takes an Operating Systems string and attempts to standardize it
+# by looking at the list of known products. for example, if the
+# operating system contains the string 'laserjet' it will be 
+# marked as a printer
 sub os_info_search( $ )
 {
 	my $os_string = shift;
@@ -117,8 +139,19 @@ sub os_info_search( $ )
 		return $known_products{$_} if $os_string =~ /$_/i;
 	}
 
-	#return $os_string;
 	return '';
+}
+
+# takes a hash reference for a host or sub-field of the host and
+# performs a full-text search across all fields of the hash looking
+# for the given string
+sub fulltext_search( $$ )
+{
+	my $hashobject = shift;
+	my $searchterm = shift;
+
+	my $s = index Dumper($hashobject), $searchterm;
+	return $s == -1 ? 0 : 1;
 }
 
 #--------------------------------------------------------------------------------
@@ -286,6 +319,38 @@ sub device_type_try( $ )
 		}
 	}
 
+	#------------------------------------------------------------------------
+	#	Attempt #9 -- look for keywords in services suggesting
+	#		known apple projects
+	#------------------------------------------------------------------------
+
+	foreach my $service ( @{$host->{services}} )
+	{
+		if( Dumper($service) =~ /apple|osx/i )
+		{
+			$host->{device_type} = 'apple';
+			$host->{os_flavor} = '';
+			$host->{method} = 9;
+			return if $host->{device_type} ne '';
+		}
+	}
+
+	#------------------------------------------------------------------------
+	#	Attempt #10 -- look for keywords in services suggesting
+	#		known cisco projects
+	#------------------------------------------------------------------------
+
+	foreach my $service ( @{$host->{services}} )
+	{
+		if( Dumper($service) =~ /cisco ssh/i )
+		{
+			$host->{device_type} = 'cisco';
+			$host->{os_flavor} = '';
+			$host->{method} = 10;
+			return if $host->{device_type} ne '';
+		}
+	}
+
 
 	$host->{device_type} = undef;
 	$host->{os_flavor}   = undef;
@@ -332,8 +397,6 @@ sub read_xml_files( $ )
 		push @finished_scans, $_ if grep { /\/nmaprun/ } @lines;
 	
 		progress( "Reading in XML files: [%5d / %5d]", scalar @files );
-
-		last if $TEST && scalar @finished_scans == $TESTAMOUNT;
 	}
 	
 	die "Found no finished nmap scans in dir: $ARGV[0]" if scalar @finished_scans == 0;
@@ -420,7 +483,6 @@ sub parse_hosts( $ )
 		#------------------------------------------------------------------------
 
 		# try to obtain smb info
-		#
 		if( exists $host->{hostscript}->{'smb-os-discovery'}->{contents} )
 		{
 			my %smb_hash;
@@ -448,7 +510,6 @@ sub parse_hosts( $ )
 		}
 
 		# try to obtain 100-confidence OS guesses
-		#
 		if( defined $host->{os}->{osmatch_name_accuracy} && $host->{os}->{osmatch_name_accuracy}->[0] eq '100' )
 		{
 			$h{os_guess} = $host->{os}->{osmatch_name}->[0];
